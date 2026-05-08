@@ -1,4 +1,3 @@
-
 // ======================
 // ROI
 // ======================
@@ -11,14 +10,17 @@ Map.addLayer(roi, {}, 'ROI');
 var l5 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2");
 
 // ======================
-// CLOUD MASK FUNCTION
+// CLOUD MASK FUNCTION (FIXED)
 // ======================
 function maskL5sr(image) {
 
   var qa = image.select('QA_PIXEL');
 
-  var mask = qa.bitwiseAnd(1 << 3).eq(0)
-    .and(qa.bitwiseAnd(1 << 4).eq(0));
+  // Mask: cloud shadow + dilated cloud + cloud + snow
+  var mask = qa.bitwiseAnd(1 << 1).eq(0)   // Dilated cloud
+    .and(qa.bitwiseAnd(1 << 3).eq(0))      // Cloud shadow
+    .and(qa.bitwiseAnd(1 << 4).eq(0))      // Snow
+    .and(qa.bitwiseAnd(1 << 5).eq(0));     // Cloud
 
   var optical = image.select('SR_B.*')
     .multiply(0.0000275)
@@ -33,7 +35,7 @@ function maskL5sr(image) {
 // ======================
 var image = l5
   .filterBounds(roi)
-  .filterDate('2010-11-01', '2010-12-30')
+  .filterDate('2010-11-01', '2010-12-31')
   .map(maskL5sr)
   .median()
   .clip(roi);
@@ -118,7 +120,7 @@ var trainSet = random.filter(ee.Filter.lt('random', 0.8));
 var testSet = random.filter(ee.Filter.gte('random', 0.8));
 
 // ======================
-// RANDOM FOREST
+// RANDOM FOREST CLASSIFIER
 // ======================
 var classifier = ee.Classifier.smileRandomForest({
   numberOfTrees: 500
@@ -138,7 +140,7 @@ Map.addLayer(classified,
   'LULC 2010');
 
 // ======================
-// ACCURACY
+// ACCURACY ASSESSMENT
 // ======================
 var validated = testSet.classify(classifier);
 
@@ -151,15 +153,13 @@ print('Producer Accuracy', cm.producersAccuracy());
 print('User Accuracy', cm.consumersAccuracy());
 
 // ======================
-// AREA CALCULATION
+// AREA CALCULATION (FIXED)
 // ======================
 var pixelArea = ee.Image.pixelArea();
 
 function getArea(classValue, name) {
 
-  var areaImage = pixelArea.updateMask(
-    classified.eq(classValue)
-  );
+  var areaImage = pixelArea.updateMask(classified.eq(classValue));
 
   var area = areaImage.reduceRegion({
     reducer: ee.Reducer.sum(),
@@ -168,8 +168,9 @@ function getArea(classValue, name) {
     maxPixels: 1e13
   });
 
-  print(name + ' Area (km²):',
-    ee.Number(area.get('area')).divide(1e6));
+  var value = ee.Number(area.values().get(0));
+
+  print(name + ' Area (km²):', value.divide(1e6));
 }
 
 getArea(0, 'Water');
