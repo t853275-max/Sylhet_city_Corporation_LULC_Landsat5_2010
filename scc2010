@@ -1,0 +1,191 @@
+
+// ======================
+// ROI
+// ======================
+Map.centerObject(roi, 10);
+Map.addLayer(roi, {}, 'ROI');
+
+// ======================
+// LANDSAT 5 (2010)
+// ======================
+var l5 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2");
+
+// ======================
+// CLOUD MASK FUNCTION
+// ======================
+function maskL5sr(image) {
+
+  var qa = image.select('QA_PIXEL');
+
+  var mask = qa.bitwiseAnd(1 << 3).eq(0)
+    .and(qa.bitwiseAnd(1 << 4).eq(0));
+
+  var optical = image.select('SR_B.*')
+    .multiply(0.0000275)
+    .add(-0.2);
+
+  return image.addBands(optical, null, true)
+              .updateMask(mask);
+}
+
+// ======================
+// IMAGE COMPOSITE (DRY SEASON)
+// ======================
+var image = l5
+  .filterBounds(roi)
+  .filterDate('2010-09-01', '2011-04-30')
+  .map(maskL5sr)
+  .median()
+  .clip(roi);
+
+// ======================
+// INDICES
+// ======================
+
+// NDVI
+var ndvi = image.normalizedDifference(['SR_B4', 'SR_B3']).rename('NDVI');
+
+// NDBI
+var ndbi = image.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDBI');
+
+// MNDWI
+var mndwi = image.normalizedDifference(['SR_B2', 'SR_B5']).rename('MNDWI');
+
+// SAVI
+var savi = image.expression(
+  '((NIR - RED) / (NIR + RED + 0.5)) * 1.5',
+  {
+    NIR: image.select('SR_B4'),
+    RED: image.select('SR_B3')
+  }).rename('SAVI');
+
+// EVI
+var evi = image.expression(
+  '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))',
+  {
+    NIR: image.select('SR_B4'),
+    RED: image.select('SR_B3'),
+    BLUE: image.select('SR_B1')
+  }).rename('EVI');
+
+// BSI
+var bsi = image.expression(
+  '((SWIR + RED) - (NIR + BLUE)) / ((SWIR + RED) + (NIR + BLUE))',
+  {
+    SWIR: image.select('SR_B5'),
+    RED: image.select('SR_B3'),
+    NIR: image.select('SR_B4'),
+    BLUE: image.select('SR_B1')
+  }).rename('BSI');
+
+// Add indices
+image = image.addBands([ndvi, ndbi, mndwi, savi, evi, bsi]);
+
+// ======================
+// TRAINING SAMPLES
+// ======================
+var samples = water
+  .merge(vegetation)
+  .merge(bareland)
+  .merge(buildup);
+
+// ======================
+// BANDS
+// ======================
+var bands = [
+  'SR_B1','SR_B2','SR_B3','SR_B4',
+  'SR_B5','SR_B7',
+  'NDVI','NDBI','MNDWI',
+  'SAVI','EVI','BSI'
+];
+
+// ======================
+// TRAINING DATA
+// ======================
+var training = image.select(bands).sampleRegions({
+  collection: samples,
+  properties: ['Class'],
+  scale: 30,
+  tileScale: 4
+});
+
+// ======================
+// TRAIN / TEST SPLIT
+// ======================
+var random = training.randomColumn();
+
+var trainSet = random.filter(ee.Filter.lt('random', 0.8));
+var testSet = random.filter(ee.Filter.gte('random', 0.8));
+
+// ======================
+// RANDOM FOREST
+// ======================
+var classifier = ee.Classifier.smileRandomForest({
+  numberOfTrees: 500
+}).train({
+  features: trainSet,
+  classProperty: 'Class',
+  inputProperties: bands
+});
+
+// ======================
+// CLASSIFICATION
+// ======================
+var classified = image.select(bands).classify(classifier);
+
+Map.addLayer(classified,
+  {min: 0, max: 3, palette: ['blue','green','yellow','red']},
+  'LULC 2010');
+
+// ======================
+// ACCURACY
+// ======================
+var validated = testSet.classify(classifier);
+
+var cm = validated.errorMatrix('Class', 'classification');
+
+print('Confusion Matrix', cm);
+print('Overall Accuracy', cm.accuracy());
+print('Kappa', cm.kappa());
+print('Producer Accuracy', cm.producersAccuracy());
+print('User Accuracy', cm.consumersAccuracy());
+
+// ======================
+// AREA CALCULATION
+// ======================
+var pixelArea = ee.Image.pixelArea();
+
+function getArea(classValue, name) {
+
+  var areaImage = pixelArea.updateMask(
+    classified.eq(classValue)
+  );
+
+  var area = areaImage.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: roi,
+    scale: 30,
+    maxPixels: 1e13
+  });
+
+  print(name + ' Area (km²):',
+    ee.Number(area.get('area')).divide(1e6));
+}
+
+getArea(0, 'Water');
+getArea(1, 'Vegetation');
+getArea(2, 'Bareland');
+getArea(3, 'Built-up');
+
+// ======================
+// EXPORT
+// ======================
+Export.image.toDrive({
+  image: classified,
+  description: 'LULC_2010_RF_Final',
+  folder: 'GEE_LULC',
+  fileNamePrefix: 'LULC_2010_RF_Final',
+  region: roi,
+  scale: 30,
+  maxPixels: 1e13
+});
